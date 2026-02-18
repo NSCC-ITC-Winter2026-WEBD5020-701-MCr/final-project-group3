@@ -1,3 +1,8 @@
+/**
+ * @module app/layout
+ * @description Root layout component for the Next.js application.
+ * Provides global styling, fonts, theme support, and authentication context.
+ */
 import type { Metadata } from "next";
 import { Merriweather, Source_Sans_3 } from "next/font/google";
 import "./globals.css";
@@ -8,12 +13,14 @@ import DynamicFavicon from "@/components/DynamicFavicon";
 import { ThemeProvider } from "next-themes";
 import Providers from "@/components/Providers";
 
+/** Source Sans 3 font configuration for sans-serif typography */
 const sans = Source_Sans_3({
   subsets: ["latin"],
   variable: "--font-sans-next",
   display: "swap",
 });
 
+/** Merriweather font configuration for serif typography */
 const serif = Merriweather({
   subsets: ["latin"],
   weight: ["400", "700"],
@@ -22,8 +29,7 @@ const serif = Merriweather({
 });
 
 export const metadata: Metadata = {
-  // metadataBase: new URL("https://shorelinewoodworks.ca"),
-  metadataBase: new URL("http://localhost:3000"),
+  metadataBase: new URL("https://shorelinewoodworks.ca"),
   manifest: "/manifest.json",
   title: "Shoreline Woodworks",
   description:
@@ -41,8 +47,7 @@ export const metadata: Metadata = {
     title: "Shoreline Woodworks",
     description:
       "Stairs, railings, millwork, flooring, and renovations.",
-    // url: "https://shorelinewoodworks.ca",
-    url: "http://localhost:3000",
+    url: "https://shorelinewoodworks.ca",
     siteName: "Shoreline Woodworks",
     images: [
       {
@@ -62,8 +67,23 @@ export const metadata: Metadata = {
       "Stairs, railings, millwork, flooring, and renovations.",
     images: ["/og-image.jpg"],
   },
+  // TODO: Remove when ready; also remove public/robots.txt
+  robots: "noindex, nofollow",
 };
 
+/**
+ * Root layout component that wraps all pages.
+ * Provides:
+ * - Global fonts (Source Sans 3 and Merriweather)
+ * - Theme provider with system preference support
+ * - Authentication session provider
+ * - Dynamic favicon based on theme
+ * - Navbar and Footer on all pages
+ *
+ * @param props - Component props
+ * @param props.children - Page content to render
+ * @returns The root HTML structure with providers and layout elements
+ */
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {

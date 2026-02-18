@@ -13,6 +13,7 @@ import {
   deleteFolder,
   deleteImage,
   uploadImage,
+  toDisplayUrl,
 } from "@/lib/cloudinary";
 
 /** Runtime configuration for this API route */
@@ -126,18 +127,27 @@ async function resolveFolderForDate(
 
 /**
  * Find the displayOrder index where a project with the given createdAt should sit.
- * When listed by displayOrder, newest first (0 = newest).
- * @param createdAt - The creation date to find position for
+ * Projects are listed by date (newest first), then by displayOrder within the same day.
+ * Only projects on the same calendar day are considered.
+ * @param createdAt - The creation date to find position for (target day)
  * @param excludeProjectId - Project ID to exclude from the calculation
- * @returns The displayOrder index where the project should be inserted
+ * @returns The displayOrder index where the project should be inserted within that day
  */
 async function getDisplayOrderInsertIndex(
   createdAt: Date,
   excludeProjectId: string,
 ): Promise<number> {
+  const startOfDay = new Date(createdAt);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(startOfDay);
+  endOfDay.setDate(endOfDay.getDate() + 1);
+
   const projects = await prisma.project.findMany({
-    where: { id: { not: excludeProjectId } },
-    orderBy: { displayOrder: "asc" },
+    where: {
+      id: { not: excludeProjectId },
+      createdAt: { gte: startOfDay, lt: endOfDay },
+    },
+    orderBy: [{ createdAt: "desc" }, { displayOrder: "asc" }],
     select: { id: true, displayOrder: true, createdAt: true },
   });
   const insertIndex = projects.filter((p) => p.createdAt > createdAt).length;
@@ -179,7 +189,12 @@ export async function GET(_req: Request, { params }: RouteParams) {
     }
 
     const { projectTags, ...rest } = project;
-    return NextResponse.json({ ...rest, tags: projectTags.map((pt) => pt.tag.name) });
+    return NextResponse.json({
+      ...rest,
+      imageUrl: rest.imageUrl ? toDisplayUrl(rest.imageUrl) : null,
+      images: rest.images.map((img) => ({ ...img, imageUrl: toDisplayUrl(img.imageUrl) })),
+      tags: projectTags.map((pt) => pt.tag.name),
+    });
   } catch {
     return NextResponse.json(
       { error: "Failed to fetch project" },
@@ -235,6 +250,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
     const tagsRaw = formData.get("tags");
     const featured = formData.get("featured");
     const imageEntries = formData.getAll("image");
+    const uploadedImagesRaw = formData.get("uploadedImages");
     const removeImage = formData.get("removeImage");
     const keepPublicIdsRaw = formData.getAll("keepPublicIds");
     const keepPublicIds = new Set(
@@ -289,21 +305,6 @@ export async function PATCH(req: Request, { params }: RouteParams) {
       }
     }
 
-    let displayOrderInsertIndex: number | null = null;
-    if (resolvedDate) {
-      displayOrderInsertIndex = await getDisplayOrderInsertIndex(
-        resolvedDate.createdAt,
-        id,
-      );
-      await prisma.project.updateMany({
-        where: {
-          displayOrder: { gte: displayOrderInsertIndex },
-          id: { not: id },
-        },
-        data: { displayOrder: { increment: 1 } },
-      });
-    }
-
     if (!title || typeof title !== "string") {
       return NextResponse.json(
         { error: "Title is required" },
@@ -318,6 +319,39 @@ export async function PATCH(req: Request, { params }: RouteParams) {
       );
     }
 
+    // Only reorder when the project date actually changed; otherwise we'd shift order on every edit (e.g. thumbnail change).
+    const existingStartOfDay = new Date(existing.createdAt);
+    existingStartOfDay.setHours(0, 0, 0, 0);
+    const resolvedStartOfDay = resolvedDate
+      ? new Date(resolvedDate.createdAt)
+      : null;
+    if (resolvedStartOfDay) resolvedStartOfDay.setHours(0, 0, 0, 0);
+    const dateActuallyChanged = !!(
+      resolvedDate &&
+      resolvedStartOfDay &&
+      existingStartOfDay.getTime() !== resolvedStartOfDay.getTime()
+    );
+
+    let displayOrderInsertIndex: number | null = null;
+    if (dateActuallyChanged && resolvedDate) {
+      displayOrderInsertIndex = await getDisplayOrderInsertIndex(
+        resolvedDate.createdAt,
+        id,
+      );
+      const startOfDay = new Date(resolvedDate.createdAt);
+      startOfDay.setHours(0, 0, 0, 0);
+      const endOfDay = new Date(startOfDay);
+      endOfDay.setDate(endOfDay.getDate() + 1);
+      await prisma.project.updateMany({
+        where: {
+          id: { not: id },
+          createdAt: { gte: startOfDay, lt: endOfDay },
+          displayOrder: { gte: displayOrderInsertIndex },
+        },
+        data: { displayOrder: { increment: 1 } },
+      });
+    }
+
     const imageFiles = imageEntries.filter((entry): entry is File => {
       if (!entry || typeof entry !== "object") return false;
       if (entry instanceof File) return entry.size > 0;
@@ -329,6 +363,25 @@ export async function PATCH(req: Request, { params }: RouteParams) {
         typeof fileLike.arrayBuffer === "function"
       );
     });
+
+    const uploadedImagesPreUploaded: { secureUrl: string; publicId: string }[] = [];
+    if (typeof uploadedImagesRaw === "string" && uploadedImagesRaw.trim() !== "") {
+      try {
+        const parsed = JSON.parse(uploadedImagesRaw) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (item && typeof item.secureUrl === "string" && typeof item.publicId === "string") {
+              uploadedImagesPreUploaded.push({
+                secureUrl: item.secureUrl,
+                publicId: item.publicId,
+              });
+            }
+          }
+        }
+      } catch {
+        // ignore invalid JSON
+      }
+    }
 
     let tagNames: string[] = [];
     if (typeof tagsRaw === "string") {
@@ -351,7 +404,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
 
     if (removeImage === "true") {
       // Remove all images, then optionally add new ones - must have new images
-      if (imageFiles.length === 0) {
+      if (imageFiles.length === 0 && uploadedImagesPreUploaded.length === 0) {
         return NextResponse.json(
           { error: "At least one image is required. Add new images before removing all." },
           { status: 400 },
@@ -371,7 +424,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
       }
       await prisma.projectImage.deleteMany({ where: { projectId: id } });
 
-      if (imageFiles.length > 0) {
+      if (imageFiles.length > 0 || uploadedImagesPreUploaded.length > 0) {
         const uploadedImages: { secureUrl: string; publicId: string }[] = [];
         for (const image of imageFiles) {
           if (!ALLOWED_IMAGE_TYPES.has(image.type)) {
@@ -394,6 +447,10 @@ export async function PATCH(req: Request, { params }: RouteParams) {
           newUploadedPublicIds.push(uploaded.publicId);
           uploadedImages.push({ secureUrl: uploaded.secureUrl, publicId: uploaded.publicId });
         }
+        for (const img of uploadedImagesPreUploaded) {
+          newUploadedPublicIds.push(img.publicId);
+          uploadedImages.push({ secureUrl: img.secureUrl, publicId: img.publicId });
+        }
         const first = uploadedImages[0];
         await prisma.project.update({
           where: { id },
@@ -410,7 +467,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
             imageUrl: first.secureUrl,
             imagePublicId: first.publicId,
             cloudinaryFolder: folderToUse,
-            ...(resolvedDate && {
+            ...(dateActuallyChanged && resolvedDate && {
               createdAt: resolvedDate.createdAt,
               ...(displayOrderInsertIndex != null && { displayOrder: displayOrderInsertIndex }),
               ...(resolvedDateIsMonthOnly !== null && { dateIsMonthOnly: resolvedDateIsMonthOnly }),
@@ -440,7 +497,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
                 : existing.featured,
             imageUrl: null,
             imagePublicId: null,
-            ...(resolvedDate && {
+            ...(dateActuallyChanged && resolvedDate && {
               cloudinaryFolder: folderToUse,
               createdAt: resolvedDate.createdAt,
               ...(displayOrderInsertIndex != null && { displayOrder: displayOrderInsertIndex }),
@@ -450,13 +507,21 @@ export async function PATCH(req: Request, { params }: RouteParams) {
           },
         });
       }
-    } else if (keepPublicIds.size < existing.images.length || imageFiles.length > 0) {
+    } else if (
+      keepPublicIds.size < existing.images.length ||
+      imageFiles.length > 0 ||
+      uploadedImagesPreUploaded.length > 0
+    ) {
       // Remove some existing images and/or add new ones
       const toDelete = existing.images.filter((i) => !keepPublicIds.has(i.imagePublicId));
       const kept = existing.images
         .filter((i) => keepPublicIds.has(i.imagePublicId))
         .sort((a, b) => a.sortOrder - b.sortOrder);
-      if (kept.length === 0 && imageFiles.length === 0) {
+      if (
+        kept.length === 0 &&
+        imageFiles.length === 0 &&
+        uploadedImagesPreUploaded.length === 0
+      ) {
         return NextResponse.json(
           { error: "At least one image is required" },
           { status: 400 },
@@ -503,6 +568,10 @@ export async function PATCH(req: Request, { params }: RouteParams) {
           uploadedImages.push({ secureUrl: uploaded.secureUrl, publicId: uploaded.publicId });
         }
       }
+      for (const img of uploadedImagesPreUploaded) {
+        newUploadedPublicIds.push(img.publicId);
+        uploadedImages.push({ secureUrl: img.secureUrl, publicId: img.publicId });
+      }
 
       const firstKept = kept[0];
       const firstNew = uploadedImages[0];
@@ -523,7 +592,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
               : existing.featured,
           imageUrl: newImageUrl,
           imagePublicId: newImagePublicId,
-            ...(resolvedDate && {
+            ...(dateActuallyChanged && resolvedDate && {
               cloudinaryFolder: folderToUse,
               createdAt: resolvedDate.createdAt,
               ...(displayOrderInsertIndex != null && { displayOrder: displayOrderInsertIndex }),
@@ -555,7 +624,7 @@ export async function PATCH(req: Request, { params }: RouteParams) {
             typeof featured === "string"
               ? featured === "true"
               : existing.featured,
-          ...(resolvedDate && {
+          ...(dateActuallyChanged && resolvedDate && {
             cloudinaryFolder: folderToUse,
             createdAt: resolvedDate.createdAt,
             ...(displayOrderInsertIndex != null && { displayOrder: displayOrderInsertIndex }),
@@ -604,7 +673,12 @@ export async function PATCH(req: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "Project not found" }, { status: 404 });
     }
     const { projectTags, ...rest } = updated;
-    return NextResponse.json({ ...rest, tags: projectTags.map((pt) => pt.tag.name) });
+    return NextResponse.json({
+      ...rest,
+      imageUrl: rest.imageUrl ? toDisplayUrl(rest.imageUrl) : null,
+      images: rest.images.map((img) => ({ ...img, imageUrl: toDisplayUrl(img.imageUrl) })),
+      tags: projectTags.map((pt) => pt.tag.name),
+    });
   } catch {
     for (const publicId of newUploadedPublicIds) {
       try {
